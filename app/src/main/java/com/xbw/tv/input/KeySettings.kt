@@ -20,6 +20,7 @@ object KeySettings {
     private const val PHYS_PREFIX = "p_"
     private const val LOG_PREFIX = "l_"
     private const val KEY_MENU_HOTKEY = "menu_hotkey"
+    private const val MAX_PLAYERS = 4
 
     // ------------------------------------------------------------------
     // 默认物理映射：Android KeyEvent → GameButton
@@ -91,14 +92,15 @@ object KeySettings {
      *
      * ⚠️ 刻意**不**用 START 做默认值：NES 的 Start 本身就是"开始/暂停"游戏功能键，
      *   若同时当菜单键，玩家按 Start 开始游戏时菜单会被顶出来。
-     *   默认用 **SELECT（Select/Back 键）**，并保留两条备用路径：
+     *   默认用 **MENU 键**，保留 SELECT 给街机投币，并保留两条备用路径：
      *   长按 START 呼出菜单、遥控器 BACK 呼出菜单（见 NativeGameActivity）。
      */
-    var menuHotkey: Int = KeyEvent.KEYCODE_BUTTON_SELECT
+    var menuHotkey: Int = KeyEvent.KEYCODE_MENU
         private set
 
     // 运行时热路径映射（同步读）
     private val physical = HashMap(DEFAULT_PHYSICAL)
+    private val otherPhysical = Array(3) { HashMap(DEFAULT_PHYSICAL) }
     private val logical = HashMap<GameButton, GameButton.WebKey>()
 
     private val _version = MutableStateFlow(0)
@@ -110,7 +112,7 @@ object KeySettings {
     fun init(context: Context) {
         val p = context.applicationContext.getSharedPreferences(PREF, Context.MODE_PRIVATE)
         pref = p
-        menuHotkey = p.getInt(KEY_MENU_HOTKEY, KeyEvent.KEYCODE_BUTTON_SELECT)
+        menuHotkey = p.getInt(KEY_MENU_HOTKEY, KeyEvent.KEYCODE_MENU)
 
         physical.clear()
         physical.putAll(DEFAULT_PHYSICAL)
@@ -119,6 +121,19 @@ object KeySettings {
             val keyCode = key.removePrefix(PHYS_PREFIX).toIntOrNull() ?: continue
             val btn = GameButton.fromId(value as? String)
             if (btn != null) physical[keyCode] = btn else physical.remove(keyCode)
+        }
+
+        for (player in 1 until MAX_PLAYERS) {
+            val map = otherPhysical[player - 1]
+            map.clear()
+            map.putAll(DEFAULT_PHYSICAL)
+            val prefix = "p${player + 1}_"
+            for ((key, value) in p.all) {
+                if (!key.startsWith(prefix)) continue
+                val code = key.removePrefix(prefix).toIntOrNull() ?: continue
+                val btn = GameButton.fromId(value as? String)
+                if (btn != null) map[code] = btn else map.remove(code)
+            }
         }
 
         logical.clear()
@@ -135,20 +150,49 @@ object KeySettings {
     }
 
     /** 物理键 → 逻辑键；未映射返回 null（该键交给系统/UI 焦点系统） */
-    fun logicalOf(keyCode: Int): GameButton? = physical[keyCode]
+    fun logicalOf(keyCode: Int): GameButton? = logicalOf(0, keyCode)
+
+    /** 玩家编号 0..3，每位玩家使用独立的物理键配置。 */
+    fun logicalOf(player: Int, keyCode: Int): GameButton? = when (player) {
+        0 -> physical[keyCode]
+        in 1..3 -> otherPhysical[player - 1][keyCode]
+        else -> null
+    }
 
     /** 逻辑键 → 网页键盘描述 */
     fun webKeyOf(btn: GameButton): GameButton.WebKey = logical[btn] ?: btn.webKey()
 
-    fun snapshotPhysical(): Map<Int, GameButton> = physical.toMap()
+    fun snapshotPhysical(): Map<Int, GameButton> = snapshotPhysical(0)
+    fun snapshotPhysical(player: Int): Map<Int, GameButton> = when (player) {
+        0 -> physical.toMap()
+        in 1..3 -> otherPhysical[player - 1].toMap()
+        else -> emptyMap()
+    }
     fun snapshotLogical(): Map<GameButton, GameButton.WebKey> = logical.toMap()
 
-    fun setPhysical(keyCode: Int, button: GameButton?) {
-        if (button == null) physical.remove(keyCode) else physical[keyCode] = button
-        pref!!.edit().apply {
-            if (button == null) remove(PHYS_PREFIX + keyCode)
-            else putString(PHYS_PREFIX + keyCode, button.id)
-        }.apply()
+    fun setPhysical(keyCode: Int, button: GameButton?) = setPhysical(0, keyCode, button)
+
+    fun setPhysical(player: Int, keyCode: Int, button: GameButton?) {
+        if (player !in 0..3) return
+        val map = if (player == 0) physical else otherPhysical[player - 1]
+        if (button == null) map.remove(keyCode) else map[keyCode] = button
+        val prefix = if (player == 0) PHYS_PREFIX else "p${player + 1}_"
+        pref?.edit()?.apply {
+            if (button == null) putString(prefix + keyCode, "")
+            else putString(prefix + keyCode, button.id)
+        }?.apply()
+        _version.value++
+    }
+
+    fun resetPlayer(player: Int) {
+        if (player !in 0..3) return
+        val prefix = if (player == 0) PHYS_PREFIX else "p${player + 1}_"
+        val editor = pref?.edit()
+        pref?.all?.keys?.filter { it.startsWith(prefix) }?.forEach { editor?.remove(it) }
+        editor?.apply()
+        val map = if (player == 0) physical else otherPhysical[player - 1]
+        map.clear()
+        map.putAll(DEFAULT_PHYSICAL)
         _version.value++
     }
 
@@ -170,9 +214,10 @@ object KeySettings {
         pref?.edit()?.clear()?.apply()
         physical.clear()
         physical.putAll(DEFAULT_PHYSICAL)
+        otherPhysical.forEach { it.clear(); it.putAll(DEFAULT_PHYSICAL) }
         logical.clear()
         for (btn in GameButton.entries) logical[btn] = btn.webKey()
-        menuHotkey = KeyEvent.KEYCODE_BUTTON_SELECT
+        menuHotkey = KeyEvent.KEYCODE_MENU
         _version.value++
     }
 
