@@ -84,7 +84,7 @@ jobs:
             VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
             echo "previous release: $LATEST -> next: v$VERSION"
           else
-            VERSION="0.0.1"     # 首个正式版；旧式 tag（v13 / build-12）一律视为历史
+            VERSION="0.0.13"    # 无 Release 的 fork 从多人版 0.0.13 起步
             echo "no semver release yet (latest='$LATEST') -> start at v$VERSION"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
