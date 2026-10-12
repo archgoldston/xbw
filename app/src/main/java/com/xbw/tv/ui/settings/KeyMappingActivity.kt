@@ -3,59 +3,31 @@ package com.xbw.tv.ui.settings
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.Gravity
+import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.xbw.tv.R
 import com.xbw.tv.input.GameButton
 import com.xbw.tv.input.KeySettings
 import com.xbw.tv.input.MotionKeyBridge
+import com.xbw.tv.input.PlayerInputRouter
 import com.xbw.tv.ui.common.Nav
 
-/**
- * 按键映射页（方案 7.3「按键自定义」的两层编辑器，纯代码布局免 XML）：
- *
- *  每行 = 一个逻辑键（A/B/↑/Start…）：
- *   - 左右方向键：循环切换该键注入网页的键盘码（KeyboardEvent.code）；
- *   - 按 A（确认）：进入「物理捕获」——再按一个手柄键，把这个物理键绑定给该逻辑键；
- *   - 按 B：取消捕获 / 返回。
- *
- * 保存即时生效（写 SharedPreferences + 内存表，GameActivity 下一次按键就会用新映射）。
- */
+/** 原生 libretro 1~4 人按键设置。每位玩家的物理映射彼此独立。 */
 class KeyMappingActivity : AppCompatActivity() {
-
-    /** 可切换的网页键盘码候选（覆盖 FC/街机/h5 常用键位） */
-    private val candidates = listOf(
-        GameButton.WebKey("ArrowUp", "ArrowUp", 38),
-        GameButton.WebKey("ArrowDown", "ArrowDown", 40),
-        GameButton.WebKey("ArrowLeft", "ArrowLeft", 37),
-        GameButton.WebKey("ArrowRight", "ArrowRight", 39),
-        GameButton.WebKey("KeyX", "x", 88),
-        GameButton.WebKey("KeyZ", "z", 90),
-        GameButton.WebKey("KeyS", "s", 83),
-        GameButton.WebKey("KeyA", "a", 65),
-        GameButton.WebKey("KeyQ", "q", 81),
-        GameButton.WebKey("KeyW", "w", 87),
-        GameButton.WebKey("KeyE", "e", 69),
-        GameButton.WebKey("Enter", "Enter", 13),
-        GameButton.WebKey("ShiftLeft", "Shift", 16),
-        GameButton.WebKey("Space", " ", 32),
-        GameButton.WebKey("KeyC", "c", 67),
-        GameButton.WebKey("KeyV", "v", 86),
-        GameButton.WebKey("KeyF", "f", 70),
-        GameButton.WebKey("KeyG", "g", 71),
-        GameButton.WebKey("KeyT", "t", 84)
-    )
-
     private lateinit var container: LinearLayout
+    private lateinit var router: PlayerInputRouter
+    private lateinit var deviceRow: TextView
+    private var player = 0 // libretro 端口 0..3
+    private val playerTabs = mutableListOf<TextView>()
     private val rows = mutableMapOf<GameButton, RowHolder>()
-
-    /** 正在等待物理按键捕获的逻辑键 */
     private var capturingFor: GameButton? = null
     private var captureArmedAt = 0L
     private val hatX = intArrayOf(0)
@@ -63,183 +35,209 @@ class KeyMappingActivity : AppCompatActivity() {
     private val stickX = intArrayOf(0)
     private val stickY = intArrayOf(0)
 
-    private inner class RowHolder(val root: View, val labelTv: TextView, val valueTv: TextView)
+    private inner class RowHolder(val root: View, val value: TextView)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
+        router = PlayerInputRouter(this)
         val scroll = ScrollView(this).apply {
             setBackgroundResource(R.drawable.bg_lobby)
             isFillViewport = true
         }
         container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(48), dp(24), dp(48), dp(32))
+            setPadding(dp(40), dp(24), dp(40), dp(30))
         }
         scroll.addView(container)
         setContentView(scroll)
 
-        container.addView(makeHeader())
+        container.addView(textLine("四人按键映射", 26f, true))
+        container.addView(textLine(
+            "先选择玩家，再为该玩家指定手柄并逐键设置。点按按键行后，在对应手柄上按一下即可绑定。" +
+                " 游戏中的 Select 可用于投币；菜单用遥控器 MENU / BACK 或手柄 MODE。",
+            14f, false
+        ).apply { setPadding(0, dp(6), 0, dp(16)) })
 
-        for (btn in GameButton.entries) {
-            addRow(btn)
+        val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for (p in 0..3) {
+            val tab = TextView(this).apply {
+                text = "玩家${p + 1}"
+                textSize = 17f
+                gravity = Gravity.CENTER
+                setTextColor(ContextCompat.getColor(context, R.color.xbw_text_primary))
+                setPadding(dp(12), dp(17), dp(12), dp(17))
+                isFocusable = true
+                layoutParams = LinearLayout.LayoutParams(0, dp(64), 1f).apply {
+                    marginEnd = dp(6)
+                }
+                setOnClickListener { switchPlayer(p) }
+                setOnKeyListener { _, code, event ->
+                    if (event.action == KeyEvent.ACTION_DOWN && code == KeyEvent.KEYCODE_BUTTON_A) {
+                        switchPlayer(p); true
+                    } else false
+                }
+            }
+            tabs.addView(tab)
+            playerTabs += tab
         }
+        container.addView(tabs)
+
+        deviceRow = textLine("", 15f, false).apply {
+            setBackgroundResource(R.drawable.bg_setting_item)
+            setPadding(dp(14), dp(18), dp(14), dp(18))
+            isFocusable = true
+            setOnClickListener { chooseDevice() }
+        }
+        container.addView(deviceRow)
+        container.addView(textLine("以下设置独立保存，不会覆盖其他玩家：", 13f, false)
+            .apply { setPadding(0, dp(15), 0, dp(10)) })
+        for (btn in GameButton.entries) addRow(btn)
+        val reset = textLine("恢复当前玩家的默认按键", 16f, true).apply {
+            setBackgroundResource(R.drawable.bg_setting_item)
+            setPadding(dp(14), dp(20), dp(14), dp(20))
+            isFocusable = true
+            setOnClickListener {
+                AlertDialog.Builder(this@KeyMappingActivity)
+                    .setTitle("恢复玩家${player + 1}默认按键？")
+                    .setPositiveButton("恢复") { _, _ ->
+                        KeySettings.resetPlayer(player)
+                        refreshAll()
+                        Nav.toast(this@KeyMappingActivity, "玩家${player + 1}已恢复默认键位")
+                    }
+                    .setNegativeButton("取消", null).show()
+            }
+        }
+        container.addView(reset)
         refreshAll()
-
-        // 第一行抢焦点
-        container.post {
-            rows.values.firstOrNull()?.root?.requestFocus()
-        }
+        tabs.post { playerTabs[0].requestFocus() }
     }
 
-    private fun makeHeader(): View {
-        val ll = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, dp(16))
+    private fun textLine(value: String, size: Float, bold: Boolean): TextView = TextView(this).apply {
+        text = value
+        textSize = size
+        setTextColor(ContextCompat.getColor(context,
+            if (bold) R.color.xbw_text_primary else R.color.xbw_text_secondary))
+        if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+    }
+
+    private fun switchPlayer(p: Int) {
+        if (capturingFor != null) stopCapture("已取消捕获")
+        player = p
+        refreshAll()
+        playerTabs[p].requestFocus()
+    }
+
+    private fun chooseDevice() {
+        val devices = router.devices()
+        val items = arrayOf("自动分配（优先按手柄接入顺序）") + devices.map {
+            "${it.name}（设备 #${it.id}${if (it.controller) " / 手柄" else " / 键盘遥控"}）"
         }
-        ll.addView(TextView(this).apply {
-            text = getString(R.string.settings_mapping)
-            setTextColor(ContextCompat.getColor(context, R.color.xbw_text_primary))
-            textSize = 26f
-            setTypeface(typeface, android.graphics.Typeface.BOLD)
-        })
-        ll.addView(TextView(this).apply {
-            text = getString(R.string.mapping_hint)
-            setTextColor(ContextCompat.getColor(context, R.color.xbw_text_disabled))
-            textSize = 13f
-            setPadding(0, dp(6), 0, 0)
-        })
-        return ll
+        AlertDialog.Builder(this)
+            .setTitle("为玩家${player + 1}选择输入设备")
+            .setItems(items) { _, index ->
+                router.assign(player, if (index == 0) null else devices[index - 1].id)
+                refreshAll()
+                Nav.toast(this, "已保存玩家${player + 1}的设备分配")
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun addRow(btn: GameButton) {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = dp(64)
-            setPadding(dp(16), 0, dp(16), 0)
+            minimumHeight = dp(62)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
             setBackgroundResource(R.drawable.bg_setting_item)
             isFocusable = true
-            isFocusableInTouchMode = false
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).also { it.bottomMargin = dp(8) }
+            layoutParams = LinearLayout.LayoutParams(-1, -2).also { it.bottomMargin = dp(7) }
         }
-        val label = TextView(this).apply {
-            text = btn.label
-            setTextColor(ContextCompat.getColor(context, R.color.xbw_text_primary))
-            textSize = 16f
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        val label = textLine(btn.label, 16f, true).apply {
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
-        val value = TextView(this).apply {
-            setTextColor(ContextCompat.getColor(context, R.color.xbw_text_secondary))
-            textSize = 14f
+        val value = textLine("", 13f, false).apply {
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1.4f)
         }
         row.addView(label)
         row.addView(value)
-        container.addView(row)
-
-        // 捕获期间不在行上处理按键，避免焦点系统把手柄键吃掉
+        row.setOnClickListener { if (capturingFor == btn) stopCapture("已取消") else startCapture(btn) }
         row.setOnKeyListener { _, keyCode, event ->
             if (capturingFor != null) return@setOnKeyListener true
             if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
             when (keyCode) {
-                KeyEvent.KEYCODE_DPAD_LEFT -> { stepWebKey(btn, -1); true }
-                KeyEvent.KEYCODE_DPAD_RIGHT -> { stepWebKey(btn, +1); true }
-                KeyEvent.KEYCODE_DPAD_CENTER,
-                KeyEvent.KEYCODE_ENTER,
-                KeyEvent.KEYCODE_BUTTON_A,
-                KeyEvent.KEYCODE_BUTTON_START -> {
-                    startCapture(btn)
-                    true
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_START -> {
+                    startCapture(btn); true
                 }
                 else -> false
             }
         }
-        row.setOnClickListener {
-            if (capturingFor == btn) stopCapture("已取消") else startCapture(btn)
-        }
-        rows[btn] = RowHolder(row, label, value)
-    }
-
-    private fun stepWebKey(btn: GameButton, delta: Int) {
-        val cur = KeySettings.webKeyOf(btn)
-        val idx = candidates.indexOfFirst { it.code == cur.code }
-            .let { if (it < 0) candidates.indexOfFirst { c -> c.keyCode == cur.keyCode } else it }
-            .let { if (it < 0) 0 else it }
-        val next = candidates[(idx + delta + candidates.size) % candidates.size]
-        KeySettings.setLogical(btn, next)
-        refreshRow(btn)
-        Nav.toast(this, getString(R.string.mapping_saved_hint, btn.label, next.code))
+        container.addView(row)
+        rows[btn] = RowHolder(row, value)
     }
 
     private fun startCapture(btn: GameButton) {
         capturingFor = btn
         captureArmedAt = SystemClock.uptimeMillis() + 280
+        hatX[0] = 0; hatY[0] = 0; stickX[0] = 0; stickY[0] = 0
         refreshAll()
-        Nav.toast(this, "请按下要绑定给「${btn.label}」的键（手柄/USB 两种模式均可）")
+        Nav.toast(this, "玩家${player + 1}：请按下「${btn.label}」对应的手柄键（BACK 取消）")
     }
 
-    private fun acceptPhysical(code: Int, target: GameButton) {
-        if (MotionKeyBridge.isIgnorableSystemKey(code)) return
-        if (code == KeyEvent.KEYCODE_BACK) {
-            stopCapture("已取消")
-            return
-        }
-        if (SystemClock.uptimeMillis() < captureArmedAt) return
-        KeySettings.setPhysical(code, target)
-        stopCapture("已绑定：${MotionKeyBridge.describeBind(code)} → ${target.label}")
+    private fun acceptPhysical(code: Int, deviceId: Int) {
+        val target = capturingFor ?: return
+        if (code == KeyEvent.KEYCODE_BACK) { stopCapture("已取消"); return }
+        if (MotionKeyBridge.isIgnorableSystemKey(code) || SystemClock.uptimeMillis() < captureArmedAt) return
+        KeySettings.setPhysical(player, code, target)
+        // 用对应手柄直接录入键位时，同步将它指派给该玩家。
+        val dev = InputDevice.getDevice(deviceId)
+        val controller = dev != null && ((dev.sources and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+            (dev.sources and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK)
+        if (controller || player > 0 && dev != null) router.assign(player, deviceId)
+        stopCapture("玩家${player + 1}：${MotionKeyBridge.describeBind(code)} → ${target.label} 已保存")
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val target = capturingFor
-        if (target != null) {
-            if (event.action != KeyEvent.ACTION_DOWN) return true
-            if (event.repeatCount > 0) return true
-            acceptPhysical(MotionKeyBridge.bindCode(event), target)
+        if (capturingFor != null) {
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0)
+                acceptPhysical(MotionKeyBridge.bindCode(event), event.deviceId)
             return true
         }
         return super.dispatchKeyEvent(event)
     }
 
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
-        val target = capturingFor
-        if (target != null) {
+        if (capturingFor != null) {
             MotionKeyBridge.dispatchMotion(event, hatX, hatY, stickX, stickY) { code, down ->
-                if (down) acceptPhysical(code, target)
+                if (down) acceptPhysical(code, event.deviceId)
             }
             return true
         }
         return super.dispatchGenericMotionEvent(event)
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (capturingFor != null) return true
-        return super.onKeyDown(keyCode, event)
-    }
-
-    private fun stopCapture(msg: String) {
+    private fun stopCapture(message: String) {
         capturingFor = null
         refreshAll()
-        Nav.toast(this, msg)
+        Nav.toast(this, message)
     }
 
-    private fun refreshAll() = rows.keys.forEach { refreshRow(it) }
-
-    private fun refreshRow(btn: GameButton) {
-        val holder = rows[btn] ?: return
-        val web = KeySettings.webKeyOf(btn)
-        // 物理来源：默认表 + 用户覆盖表都看
-        val bound = KeySettings.snapshotPhysical().filterValues { it == btn }.keys
-            .joinToString("/") { MotionKeyBridge.describeBind(it) }
-            .ifBlank { "未绑定" }
-        val capturing = capturingFor == btn
-        holder.valueTv.text = if (capturing) "请按键…" else "网页:${web.code}  ⇐  $bound"
-        holder.root.setBackgroundResource(
-            if (capturing) R.drawable.btn_tv else R.drawable.bg_setting_item
-        )
+    private fun refreshAll() {
+        for (p in 0..3) playerTabs[p].setBackgroundResource(
+            if (p == player) R.drawable.btn_tv else R.drawable.bg_setting_item)
+        deviceRow.text = "玩家${player + 1}使用的设备：${router.assignmentLabel(player)}\n点击选择 / 更换手柄"
+        val mapping = KeySettings.snapshotPhysical(player)
+        for ((btn, holder) in rows) {
+            val keys = mapping.filterValues { it == btn }.keys.sorted()
+            holder.value.text = if (capturingFor == btn) "正在等待按键…" else
+                keys.take(4).joinToString(" / ") { MotionKeyBridge.describeBind(it) }
+                    .ifBlank { "未绑定" } + if (keys.size > 4) " 等${keys.size}键" else ""
+            holder.root.setBackgroundResource(
+                if (capturingFor == btn) R.drawable.btn_tv else R.drawable.bg_setting_item)
+        }
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 }
