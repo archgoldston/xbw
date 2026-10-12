@@ -21,6 +21,8 @@ import com.xbw.tv.data.update.UpdatePrompt
 import com.xbw.tv.databinding.ActivityNativeGameBinding
 import com.xbw.tv.input.GameButton
 import com.xbw.tv.input.KeySettings
+import com.xbw.tv.input.MotionKeyBridge
+import com.xbw.tv.input.PlayerInputRouter
 import com.xbw.tv.ui.common.Nav
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -116,10 +118,11 @@ class NativeGameActivity : AppCompatActivity() {
     private var arcadeOptionsLoaded = false
     private val cheatAdapter = CheatAdapter { pos -> toggleCheat(pos) }
 
-    /** 当前按住位图（含摇杆折算位），每次变更推给 native */
-    private var padBits = 0
-    private val heldButtons = HashSet<GameButton>()
-    private var axisBits = 0
+    /** 多人输入：按设备+键分别跟踪，不允许 P2 放开同名按键导致 P1 被释放。 */
+    private lateinit var playerRouter: PlayerInputRouter
+    private val heldKeys = HashMap<Pair<Int, Int>, Pair<Int, GameButton>>()
+    private val axisByDevice = HashMap<Int, Int>()
+    private val padBits = IntArray(4)
 
     private val stateFile: File by lazy {
         File(filesDir, "roms/$gameId/quick.state")
@@ -128,6 +131,7 @@ class NativeGameActivity : AppCompatActivity() {
     @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        playerRouter = PlayerInputRouter(this)
         binding = ActivityNativeGameBinding.inflate(layoutInflater)
         setContentView(binding.root)
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -521,20 +525,29 @@ class NativeGameActivity : AppCompatActivity() {
 
     private fun toast(t: String) = Nav.toast(this, t)
 
-    // ── 输入：物理键 → GameButton → retro 位图 ─────────────────────────
+    // ── 四人输入：Android 设备 → 玩家 0..3 → 玩家专用按键位图 ──────────
     private fun pushBits() {
-        var bits = axisBits
-        for (b in heldButtons) RETRO_BIT[b]?.let { bits = bits or (1 shl it) }
-        if (bits != padBits) {
-            padBits = bits
-            core.setInput(bits)
-            Log.d("NativeInput", "bits=0x%x".format(bits))
+        val bits = IntArray(4)
+        for ((_, pressed) in heldKeys) {
+            val (p, b) = pressed
+            if (p in 0..3) RETRO_BIT[b]?.let { bits[p] = bits[p] or (1 shl it) }
+        }
+        for ((deviceId, axis) in axisByDevice) {
+            val p = playerRouter.playerOf(deviceId)
+            if (p in 0..3) bits[p] = bits[p] or axis
+        }
+        for (p in 0..3) {
+            if (bits[p] != padBits[p]) {
+                padBits[p] = bits[p]
+                core.setInput(p, bits[p])
+                Log.d("NativeInput", "player=${p + 1} bits=0x%x".format(bits[p]))
+            }
         }
     }
 
     private fun clearPad() {
-        heldButtons.clear()
-        axisBits = 0
+        heldKeys.clear()
+        axisByDevice.clear()
         pushBits()
     }
 
@@ -603,7 +616,7 @@ class NativeGameActivity : AppCompatActivity() {
                     }
                 }
             }
-            // 菜单热键（默认 SELECT）也能关面板
+            // 菜单热键（默认 MENU）也能关面板
             if (event.keyCode == KeySettings.menuHotkey && event.action == KeyEvent.ACTION_UP) {
                 hideCheatPanel(); return true
             }
@@ -622,49 +635,57 @@ class NativeGameActivity : AppCompatActivity() {
                     return true
                 }
             }
-            // 菜单热键（默认 SELECT）收起工具条
+            // 菜单热键（默认 MENU）收起工具条
             if (event.keyCode == KeySettings.menuHotkey && event.action == KeyEvent.ACTION_UP) {
                 hideToolbar(); return true
             }
             return super.dispatchKeyEvent(event)
         }
 
-        // 游戏模式
-        if (event.keyCode == KeySettings.menuHotkey ||
-            event.keyCode == KeyEvent.KEYCODE_MENU ||
-            (event.keyCode == KeyEvent.KEYCODE_BUTTON_START && event.repeatCount >= 8)
-        ) {
-            if (event.action == KeyEvent.ACTION_UP && event.repeatCount < 8) {
-                if (event.keyCode != KeyEvent.KEYCODE_BUTTON_START) showToolbar()
-            } else if (event.action == KeyEvent.ACTION_UP && event.repeatCount >= 8) {
-                showToolbar()
-            }
+        // 只有玩家1可以通过菜单热键呼出工具条，避免玩家2~4的投币/开始被吞。
+        val player = playerRouter.playerOf(event.deviceId)
+        if (player == 0 && (event.keyCode == KeySettings.menuHotkey ||
+                event.keyCode == KeyEvent.KEYCODE_MENU)) {
+            if (event.action == KeyEvent.ACTION_UP) showToolbar()
+            return true
+        }
+        // 长按 P1 Start 呼出工具条（ACTION_UP 的 repeatCount 通常为 0，故须在 DOWN 判断）。
+        if (player == 0 && event.keyCode == KeyEvent.KEYCODE_BUTTON_START &&
+            event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 8) {
+            showToolbar()
             return true
         }
 
         // HOME 家族键（遥控器 KEYCODE_HOME 多数 ROM 被系统截走，能到达就一并处理；
         // 手柄 Guide/Home 键标准上报为 BUTTON_MODE）→ 呼出工具条：先存档/读档再退出才安全
-        if (event.keyCode == KeyEvent.KEYCODE_HOME ||
-            event.keyCode == KeyEvent.KEYCODE_BUTTON_MODE
+        if (player == 0 && (event.keyCode == KeyEvent.KEYCODE_HOME ||
+            event.keyCode == KeyEvent.KEYCODE_BUTTON_MODE)
         ) {
             if (event.action == KeyEvent.ACTION_UP) showToolbar()
             return true
         }
 
         if (event.keyCode == KeyEvent.KEYCODE_BACK) {
-            if (event.action == KeyEvent.ACTION_UP) confirmExit()
+            if (player == 0 && event.action == KeyEvent.ACTION_UP) confirmExit()
             return true
         }
 
-        val btn = KeySettings.logicalOf(event.keyCode)
-        if (btn != null) {
-            when (event.action) {
-                KeyEvent.ACTION_DOWN -> heldButtons.add(btn)
-                KeyEvent.ACTION_UP -> heldButtons.remove(btn)
+        val code = MotionKeyBridge.bindCode(event)
+        val handle = event.deviceId to code
+        val btn = if (player in 0..3) KeySettings.logicalOf(player, code) else null
+        var changed = false
+        when (event.action) {
+            KeyEvent.ACTION_DOWN -> {
+                // 同一个按键的重复事件不能在多玩家之间重复计数。
+                if (btn != null && !heldKeys.containsKey(handle)) {
+                    heldKeys[handle] = player to btn
+                    changed = true
+                }
             }
-            pushBits()
-            return true
+            KeyEvent.ACTION_UP -> changed = heldKeys.remove(handle) != null
         }
+        if (changed) pushBits()
+        if (btn != null || changed) return true
 
         // ★ USB 手柄键兜底：任何来自手柄/摇杆、未被映射的键码一律吞掉，
         //   绝不放行给系统（放行 = 焦点乱跳/黑屏，就是"部分按键失灵"的根源）
@@ -682,18 +703,26 @@ class NativeGameActivity : AppCompatActivity() {
         // 若在此吞成游戏输入，面板里方向键完全失灵（街机金手指"无法聚焦"的根因）
         if (src == 0 || toolbarVisible || cheatPanelVisible) return super.onGenericMotionEvent(event)
 
+        val player = playerRouter.playerOf(event.deviceId)
+        if (player !in 0..3) return true
         var bits = 0
         val x = event.getAxisValue(MotionEvent.AXIS_X)
         val y = event.getAxisValue(MotionEvent.AXIS_Y)
         val hx = event.getAxisValue(MotionEvent.AXIS_HAT_X)
         val hy = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
         val dead = 0.45f
-        if (x < -dead || hx < -dead) bits = bits or (1 shl RetroCore.ID_LEFT)
-        if (x > dead || hx > dead) bits = bits or (1 shl RetroCore.ID_RIGHT)
-        if (y < -dead || hy < -dead) bits = bits or (1 shl RetroCore.ID_UP)
-        if (y > dead || hy > dead) bits = bits or (1 shl RetroCore.ID_DOWN)
-        if (bits != axisBits) {
-            axisBits = bits
+        // 摇杆虚拟 DPAD 也走玩家独立映射，允许玩家2~4单独调换方向键。
+        fun addDirection(keyCode: Int) {
+            val btn = KeySettings.logicalOf(player, keyCode) ?: return
+            RETRO_BIT[btn]?.let { bits = bits or (1 shl it) }
+        }
+        if (x < -dead || hx < -dead) addDirection(KeyEvent.KEYCODE_DPAD_LEFT)
+        if (x > dead || hx > dead) addDirection(KeyEvent.KEYCODE_DPAD_RIGHT)
+        if (y < -dead || hy < -dead) addDirection(KeyEvent.KEYCODE_DPAD_UP)
+        if (y > dead || hy > dead) addDirection(KeyEvent.KEYCODE_DPAD_DOWN)
+        if (axisByDevice[event.deviceId] != bits) {
+            if (bits == 0) axisByDevice.remove(event.deviceId)
+            else axisByDevice[event.deviceId] = bits
             pushBits()
         }
         return true
