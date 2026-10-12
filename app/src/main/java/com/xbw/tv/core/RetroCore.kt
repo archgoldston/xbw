@@ -49,7 +49,7 @@ class RetroCore {
     private external fun nativeLoadCore(coreLib: String, systemDir: String, romPath: String): Boolean
     private external fun nativeSetAudioTrack(track: Any?)
     private external fun nativeSetSurface(surface: Surface?)
-    private external fun nativeSetInput(bits: Int)
+    private external fun nativeSetInput(port: Int, bits: Int)
     private external fun nativeStart(): Boolean
     private external fun nativeSetPaused(paused: Boolean)
     private external fun nativeReset()
@@ -135,7 +135,12 @@ class RetroCore {
     }
 
     fun setSurface(surface: Surface?) = nativeSetSurface(surface)
-    fun setInput(bits: Int) = nativeSetInput(bits)
+    /** 玩家端口 0..3；每个端口独立下发位图。 */
+    fun setInput(player: Int, bits: Int) {
+        if (player in 0..3) nativeSetInput(player, bits)
+    }
+    /** 兼容原有单人调用。 */
+    fun setInput(bits: Int) = setInput(0, bits)
     fun setPaused(p: Boolean) = nativeSetPaused(p)
     fun reset() = nativeReset()
 
