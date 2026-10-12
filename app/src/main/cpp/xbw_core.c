@@ -108,7 +108,8 @@ static volatile int g_paused;
 static volatile int g_reset_request;
 
 /* 输入位图：bit = RETRO_DEVICE_ID_JOYPAD_*（UI 线程写、仿真线程读） */
-static volatile int32_t g_input_bits;
+#define XBW_MAX_PLAYERS 4
+static int32_t g_input_bits[XBW_MAX_PLAYERS];
 
 /* 金手指队列：UI 线程整表替换、仿真线程应用。
  * ⚠️ retro_cheat_set 会改核心内部的读处理器（FCEUmm: FCEUI_AddCheat），
@@ -327,10 +328,11 @@ static bool cb_environment(unsigned cmd, void *data) {
 static void cb_input_poll(void) { /* 位图由 UI 线程持续更新，无需拉取 */ }
 
 static int16_t cb_input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
-    (void)index;
-    if (port != 0) return 0;
-    if (device == RETRO_DEVICE_JOYPAD) return (int16_t)((g_input_bits >> id) & 1);
-    return 0;
+    if (port >= XBW_MAX_PLAYERS || index != 0 || device != RETRO_DEVICE_JOYPAD) return 0;
+    uint32_t bits = (uint32_t)__atomic_load_n(&g_input_bits[port], __ATOMIC_RELAXED);
+    if (id == RETRO_DEVICE_ID_JOYPAD_MASK) return (int16_t)(bits & 0xffffu);
+    if (id >= 16) return 0;
+    return (int16_t)((bits >> id) & 1u);
 }
 
 static void cb_audio_sample(int16_t left, int16_t right) {
@@ -706,7 +708,8 @@ Java_com_xbw_tv_core_RetroCore_nativeLoadCore(JNIEnv *env, jclass cls, jstring c
     g_audio_ring = malloc(AUDIO_RING_SAMPLES * sizeof(int16_t));
     g_audio_head = g_audio_tail = 0;
     g_buf_format = RETRO_PIXEL_FORMAT_XRGB8888;
-    g_input_bits = 0;
+    for (int p = 0; p < XBW_MAX_PLAYERS; ++p)
+        __atomic_store_n(&g_input_bits[p], 0, __ATOMIC_RELAXED);
     g_paused = 0;
     g_reset_request = 0;
     pthread_mutex_lock(&g_opt_lock);
@@ -723,7 +726,9 @@ Java_com_xbw_tv_core_RetroCore_nativeLoadCore(JNIEnv *env, jclass cls, jstring c
     core.set_input_state(cb_input_state);
     core.set_audio_sample(cb_audio_sample);
     core.set_audio_sample_batch(cb_audio_sample_batch);
-    core.set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
+    /* FBNeo 的街机四人游戏需要 0~3 全部插上虚拟手柄。 */
+    for (unsigned p = 0; p < XBW_MAX_PLAYERS; ++p)
+        core.set_controller_port_device(p, RETRO_DEVICE_JOYPAD);
 
     if (!try_load_rom()) {
         LOGE("retro_load_game failed: %s", g_rom_path);
@@ -778,9 +783,10 @@ Java_com_xbw_tv_core_RetroCore_nativeSetSurface(JNIEnv *env, jclass cls, jobject
 }
 
 JNIEXPORT void JNICALL
-Java_com_xbw_tv_core_RetroCore_nativeSetInput(JNIEnv *env, jclass cls, jint bits) {
+Java_com_xbw_tv_core_RetroCore_nativeSetInput(JNIEnv *env, jclass cls, jint port, jint bits) {
     (void)env; (void)cls;
-    g_input_bits = (int32_t)bits;
+    if (port < 0 || port >= XBW_MAX_PLAYERS) return;
+    __atomic_store_n(&g_input_bits[port], (int32_t)bits, __ATOMIC_RELAXED);
 }
 
 JNIEXPORT jboolean JNICALL Java_com_xbw_tv_core_RetroCore_nativeStart(JNIEnv *env, jclass cls) {
