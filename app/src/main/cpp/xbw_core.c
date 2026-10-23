@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "libretro.h"
+#include "video_rotation.h"
 
 #define TAG "XbwCore"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -198,6 +199,27 @@ static unsigned g_base_w, g_base_h;
 static float g_aspect;
 static double g_fps, g_sample_rate;
 
+/* 核心回调写入方向/几何信息，UI 读取以保持旋转后画面的比例。 */
+static pthread_mutex_t g_display_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_auto_rotate;
+static unsigned g_requested_rotation, g_video_width, g_video_height;
+static float g_video_aspect;
+
+static void reset_video_layout(void) {
+    pthread_mutex_lock(&g_display_lock);
+    g_requested_rotation = g_video_width = g_video_height = 0;
+    g_video_aspect = 0.0f;
+    pthread_mutex_unlock(&g_display_lock);
+}
+
+static void set_video_geometry(const struct retro_game_geometry *geometry) {
+    pthread_mutex_lock(&g_display_lock);
+    g_video_width = geometry->base_width;
+    g_video_height = geometry->base_height;
+    g_video_aspect = geometry->aspect_ratio;
+    pthread_mutex_unlock(&g_display_lock);
+}
+
 /* 音频 SPSC 环 */
 #define AUDIO_RING_SAMPLES (128 * 1024)   /* int16 个数（交织立体声） */
 static int16_t *g_audio_ring;
@@ -230,6 +252,19 @@ static int64_t now_ns(void);
 
 static bool cb_environment(unsigned cmd, void *data) {
     switch (cmd) {
+        case RETRO_ENVIRONMENT_SET_ROTATION: {
+            if (!data || *(const unsigned *)data > 3u) return false;
+            pthread_mutex_lock(&g_display_lock);
+            g_requested_rotation = *(const unsigned *)data;
+            bool enabled = g_auto_rotate;
+            pthread_mutex_unlock(&g_display_lock);
+            return enabled;
+        }
+        case RETRO_ENVIRONMENT_SET_GEOMETRY: {
+            if (!data) return false;
+            set_video_geometry((const struct retro_game_geometry *)data);
+            return true;
+        }
         case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: {
             enum retro_pixel_format *f = (enum retro_pixel_format *)data;
             if (*f == RETRO_PIXEL_FORMAT_XRGB8888 || *f == RETRO_PIXEL_FORMAT_RGB565) {
@@ -306,7 +341,6 @@ static bool cb_environment(unsigned cmd, void *data) {
             LOGI("core options captured (v1): %d", n);
             return true;
         }
-        case RETRO_ENVIRONMENT_SET_GEOMETRY:
         case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
         case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
         case RETRO_ENVIRONMENT_SET_MEMORY_MAPS:
@@ -441,6 +475,8 @@ static void cb_video_refresh(const void *data, unsigned width, unsigned height, 
      * 每行只能拷 width*bpp 字节 —— 固定按 4bpp 拷会读越帧缓冲末尾，
      * x86_64 上直接踩保护页 SIGSEGV（真机 arm 布局宽松才侥幸没炸）。 */
     const unsigned bpp = (g_buf_format == RETRO_PIXEL_FORMAT_XRGB8888) ? 4u : 2u;
+    if ((size_t)width > SIZE_MAX / bpp ||
+        (size_t)height > SIZE_MAX / ((size_t)width * bpp)) return;
     size_t need = (size_t)width * height * bpp;
     if (s->cap < need) {
         uint8_t *np = realloc(s->px, need);
@@ -448,12 +484,14 @@ static void cb_video_refresh(const void *data, unsigned width, unsigned height, 
         s->px = np;
         s->cap = need;
     }
-    const uint8_t *src = (const uint8_t *)data;
-    const size_t rowb = (size_t)width * bpp;
-    for (unsigned y = 0; y < height; y++)
-        memcpy(s->px + (size_t)y * rowb, src + (size_t)y * pitch, rowb);
-    s->w = width;
-    s->h = height;
+    pthread_mutex_lock(&g_display_lock);
+    unsigned rotation = xbw_effective_rotation(g_auto_rotate, g_requested_rotation);
+    g_video_width = width;
+    g_video_height = height;
+    pthread_mutex_unlock(&g_display_lock);
+    if (!xbw_copy_rotated_frame(data, width, height, pitch, bpp, rotation, s->px)) return;
+    s->w = (rotation & 1u) ? height : width;
+    s->h = (rotation & 1u) ? width : height;
     s->bpp = bpp;
     g_vhead = next;
     g_video_ms += (double)(now_ns() - t0) / 1e6;
@@ -712,6 +750,7 @@ Java_com_xbw_tv_core_RetroCore_nativeLoadCore(JNIEnv *env, jclass cls, jstring c
         __atomic_store_n(&g_input_bits[p], 0, __ATOMIC_RELAXED);
     g_paused = 0;
     g_reset_request = 0;
+    reset_video_layout();
     pthread_mutex_lock(&g_opt_lock);
     clear_options_locked();   /* 新会话：上一局的金手指选项全部作废 */
     pthread_mutex_unlock(&g_opt_lock);
@@ -743,6 +782,7 @@ Java_com_xbw_tv_core_RetroCore_nativeLoadCore(JNIEnv *env, jclass cls, jstring c
     g_aspect = av.geometry.aspect_ratio;
     g_fps = av.timing.fps;
     g_sample_rate = av.timing.sample_rate;
+    set_video_geometry(&av.geometry);
     LOGI("loaded ok: base=%ux%u fps=%.3f rate=%.0f fmt=%u",
          g_base_w, g_base_h, g_fps, g_sample_rate, g_buf_format);
     return JNI_TRUE;
@@ -940,6 +980,7 @@ Java_com_xbw_tv_core_RetroCore_nativeLoadAlternativeRom(JNIEnv *env, jclass cls,
     if (!core.handle || !core.unload_game || !core.load_game) return JNI_FALSE;
     if (g_running) return JNI_FALSE;
     core.unload_game();   /* 上次 load 失败时是幂等的（nBurnDrvActive 守卫） */
+    reset_video_layout();
     const char *rp = (*env)->GetStringUTFChars(env, romPath, NULL);
     snprintf(g_rom_path, sizeof(g_rom_path), "%s", rp);
     (*env)->ReleaseStringUTFChars(env, romPath, rp);
@@ -960,7 +1001,35 @@ Java_com_xbw_tv_core_RetroCore_nativeLoadAlternativeRom(JNIEnv *env, jclass cls,
     g_fps = av.timing.fps;
     g_sample_rate = av.timing.sample_rate;
     LOGI("alternative rom loaded: %s base=%ux%u fps=%.3f", g_rom_path, g_base_w, g_base_h, g_fps);
+    set_video_geometry(&av.geometry);
     return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_xbw_tv_core_RetroCore_nativeSetAutoRotate(JNIEnv *env, jclass cls, jboolean enabled) {
+    pthread_mutex_lock(&g_display_lock);
+    g_auto_rotate = (enabled == JNI_TRUE);
+    pthread_mutex_unlock(&g_display_lock);
+}
+
+JNIEXPORT jintArray JNICALL
+Java_com_xbw_tv_core_RetroCore_nativeVideoLayout(JNIEnv *env, jclass cls) {
+    pthread_mutex_lock(&g_display_lock);
+    unsigned rotation = xbw_effective_rotation(g_auto_rotate, g_requested_rotation);
+    unsigned w = g_video_width, h = g_video_height;
+    float aspect = g_video_aspect;
+    pthread_mutex_unlock(&g_display_lock);
+    if (!(aspect > 0.0f && aspect < 100.0f))
+        aspect = h ? (float)w / (float)h : 0.0f;
+    if (rotation & 1u) {
+        unsigned tmp = w; w = h; h = tmp;
+        if (aspect > 0.0f) aspect = 1.0f / aspect;
+    }
+    if (!(aspect > 0.0f && aspect < 100.0f)) aspect = 0.0f;
+    jint values[4] = {(jint)rotation, (jint)w, (jint)h, (jint)(aspect * 10000.0f)};
+    jintArray result = (*env)->NewIntArray(env, 4);
+    if (result) (*env)->SetIntArrayRegion(env, result, 0, 4, values);
+    return result;
 }
 
 JNIEXPORT jintArray JNICALL Java_com_xbw_tv_core_RetroCore_nativeAvInfo(JNIEnv *env, jclass cls) {
