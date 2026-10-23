@@ -1,10 +1,12 @@
 package com.xbw.tv.ui.search
 
+import android.content.Intent
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.inputmethod.EditorInfo
-import android.content.Intent
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
 import com.xbw.tv.R
@@ -34,12 +36,6 @@ class SearchActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // 窗口级屏蔽输入法：搜狗 TV 对任何获焦 View 都会主动弹自己的界面，
-        // 只有 FLAG_ALT_FOCUSABLE_IM 能让 IMMS 对本窗口完全忽略 IME 显隐
-        window.setFlags(
-            android.view.WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM,
-            android.view.WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
-        )
         binding = ActivitySearchBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -49,39 +45,33 @@ class SearchActivity : AppCompatActivity() {
         binding.rvResults.itemAnimator = null
         binding.rvResults.adapter = adapter
 
-        binding.etKeyword.setOnEditorActionListener { _, actionId, _ ->
-            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
-                doSearch(); true
+        binding.etKeyword.setOnEditorActionListener { _, actionId, event ->
+            val enter = event?.keyCode == KeyEvent.KEYCODE_ENTER ||
+                event?.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+            if (actionId == EditorInfo.IME_ACTION_SEARCH || enter) {
+                // 实体键盘的按下/抬起都消费，但只提交一次；IME 动作通常没有 KeyEvent。
+                if (event == null ||
+                    (event.action == KeyEvent.ACTION_UP && !event.isCanceled)
+                ) doSearch()
+                true
             } else false
         }
-        // 手柄 B = 返回，不让系统抢焦点
+        // 保留手柄 B 返回；其他按键交给 EditText，保留选字、光标及复制粘贴快捷键。
         binding.etKeyword.setOnKeyListener { _, keyCode, event ->
-            if (keyCode == KeyEvent.KEYCODE_BUTTON_B && event.action == KeyEvent.ACTION_UP) {
-                finish(); true
+            if (keyCode == KeyEvent.KEYCODE_BUTTON_B) {
+                if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) finish()
+                true
             } else false
         }
         binding.btnDoSearch.setOnClickListener { doSearch() }
 
-        buildKeyboard()
-        // 点搜索框/按确认 → 内置键盘获焦（TV 上系统 IME 仅作中文输入的备选入口）
-        binding.etKeyword.setOnClickListener { focusKeyboard() }
-        binding.etKeyword.setOnKeyListener { _, keyCode, event ->
-            if (keyCode == KeyEvent.KEYCODE_BUTTON_B && event.action == KeyEvent.ACTION_UP) {
-                finish(); return@setOnKeyListener true
-            }
-            if (event.action == KeyEvent.ACTION_UP &&
-                (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER)
-            ) {
-                focusKeyboard(); true
-            } else false
-        }
-
-        // 系统输入法彻底屏蔽：showSoftInputOnFocus 挡不住搜狗 TV 主动抢显，
-        // keyListener=null 直接不给 IME 建输入连接（内置键盘用 setText 写入不受影响）
-        binding.etKeyword.keyListener = null
-        binding.etKeyword.isCursorVisible = true
-        binding.etKeyword.showSoftInputOnFocus = false
+        // 使用正常可编辑的文本框，不清空 keyListener，也不接管长按菜单。
+        binding.etKeyword.showSoftInputOnFocus = true
+        binding.etKeyword.setOnClickListener { showSystemKeyboard() }
         binding.etKeyword.requestFocus()
+        if (savedInstanceState == null && !intent.hasExtra("extra_keyword")) {
+            showSystemKeyboard()
+        }
 
         // 自动化/调试入口：am start --es extra_keyword xxx 直接出结果，绕开输入法
         applySeedKeyword()
@@ -101,76 +91,12 @@ class SearchActivity : AppCompatActivity() {
         }
     }
 
-    // ── 内置虚拟键盘：方向键/手柄选字，不依赖系统输入法 ──────────────────
-    private var firstKey: android.widget.Button? = null
-
-    private val kbLetterRows = listOf(
-        "qwertyuiop".toCharArray(),
-        "asdfghjkl".toCharArray(),
-        "zxcvbnm".toCharArray(),
-        "1234567890".toCharArray()
-    )
-
-    private fun buildKeyboard() {
-        val dp = resources.displayMetrics.density
-        val panel = binding.keyboardPanel
-        val textColor = androidx.core.content.ContextCompat.getColor(this, R.color.xbw_text_primary)
-
-        fun addRow(keys: List<Pair<String, (() -> Unit)?>>) {
-            val row = android.widget.LinearLayout(this).apply {
-                orientation = android.widget.LinearLayout.HORIZONTAL
-                gravity = android.view.Gravity.CENTER_HORIZONTAL
-            }
-            for ((label, action) in keys) {
-                val b = android.widget.Button(this).apply {
-                    text = label
-                    isAllCaps = false
-                    setTextColor(textColor)
-                    textSize = 15f
-                    stateListAnimator = null
-                    setBackgroundResource(R.drawable.bg_setting_item)
-                    minWidth = 0; minimumWidth = 0
-                    minHeight = 0; minimumHeight = 0
-                    setPadding((6 * dp).toInt(), 0, (6 * dp).toInt(), 0)
-                    val w = 34 + 22 * label.length
-                    layoutParams = android.widget.LinearLayout.LayoutParams(
-                        (w * dp).toInt(), (44 * dp).toInt(), 0f
-                    ).apply { setMargins((3 * dp).toInt(), (3 * dp).toInt(), (3 * dp).toInt(), (3 * dp).toInt()) }
-                    if (action != null) setOnClickListener { action() }
-                }
-                if (firstKey == null) firstKey = b
-                row.addView(b)
-            }
-            panel.addView(row)
+    private fun showSystemKeyboard() {
+        if (binding.etKeyword.requestFocus()) {
+            // AndroidX 会处理初次进入页面时窗口尚未获焦的情况，无须延时反复抢焦点。
+            WindowCompat.getInsetsController(window, binding.etKeyword)
+                .show(WindowInsetsCompat.Type.ime())
         }
-
-        for (row in kbLetterRows) {
-            val keys = row.map { ch ->
-                ch.toString() to ({ appendKey(ch); Unit } as (() -> Unit)?)
-            }.toMutableList()
-            when (String(row)) {
-                "zxcvbnm" -> keys.add("退格" to { backspaceKey() })
-                "1234567890" -> keys.add("清空" to { binding.etKeyword.setText("") })
-            }
-            addRow(keys)
-        }
-        addRow(listOf("搜索" to { doSearch() }))
-    }
-
-    private fun appendKey(ch: Char) {
-        binding.etKeyword.append(ch.toString())
-    }
-
-    private fun backspaceKey() {
-        val et = binding.etKeyword
-        val s = et.text.toString()
-        if (s.isNotEmpty()) et.setText(s.substring(0, s.length - 1))
-        et.setSelection(et.text.length)
-    }
-
-    private fun focusKeyboard() {
-        binding.keyboardPanel.visibility = android.view.View.VISIBLE
-        firstKey?.requestFocus()
     }
 
     private fun spanCount(): Int {
@@ -182,6 +108,8 @@ class SearchActivity : AppCompatActivity() {
     private fun doSearch() {
         val kw = binding.etKeyword.text.toString().trim()
         if (kw.isEmpty()) return
+        WindowCompat.getInsetsController(window, binding.etKeyword)
+            .hide(WindowInsetsCompat.Type.ime())
         binding.progress.visibility = android.view.View.VISIBLE
         binding.emptyText.visibility = android.view.View.GONE
         binding.statusLine.text = getString(R.string.search_loading)
@@ -218,8 +146,6 @@ class SearchActivity : AppCompatActivity() {
             binding.emptyText.visibility = android.view.View.VISIBLE
             binding.statusLine.text = ""
         } else {
-            // 出结果就让位给结果网格，点搜索框可再调出键盘
-            binding.keyboardPanel.visibility = android.view.View.GONE
             binding.statusLine.text = getString(R.string.search_result_fmt, r.items.size, kw)
             // 结果出来后焦点进列表第一项
             binding.rvResults.post {
@@ -239,23 +165,4 @@ class SearchActivity : AppCompatActivity() {
         binding.emptyText.visibility = android.view.View.VISIBLE
     }
 
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
-        // 焦点在内置键盘上：B 先回输入框，再退页面
-        if (binding.keyboardPanel.visibility == android.view.View.VISIBLE) {
-            var v: android.view.View? = currentFocus
-            var inPanel = false
-            while (v != null) {
-                if (v === binding.keyboardPanel) { inPanel = true; break }
-                v = v.parent as? android.view.View
-            }
-            if (inPanel) {
-                binding.etKeyword.requestFocus()
-                return
-            }
-        }
-        // 系统 IME 已屏蔽，输入框上 B 直接退出（不再走"先清焦点"那步）
-        @Suppress("DEPRECATION")
-        super.onBackPressed()
-    }
 }
