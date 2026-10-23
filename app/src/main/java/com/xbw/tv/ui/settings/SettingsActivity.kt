@@ -9,6 +9,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.xbw.tv.R
 import com.xbw.tv.XbwApplication
+import com.xbw.tv.data.display.DisplaySettings
 import com.xbw.tv.data.local.AppDatabase
 import com.xbw.tv.data.update.UpdateChecker
 import com.xbw.tv.data.update.UpdatePrompt
@@ -83,6 +84,14 @@ class SettingsActivity : AppCompatActivity() {
             UpdateSettings.setAutoCheck(this, on)
             refreshUpdateRows()
         }
+        binding.rowAutoRotate.setOnClickListener {
+            binding.switchAutoRotate.toggle()
+        }
+        binding.switchAutoRotate.setOnCheckedChangeListener { _, enabled ->
+            if (enabled != DisplaySettings.isAutoRotate(this)) {
+                DisplaySettings.setAutoRotate(this, enabled)
+            }
+        }
         binding.rowCheckUpdate.setOnClickListener { UpdatePrompt.checkNow(this) }
         binding.rowAbout.setOnClickListener {
             val ver = try {
@@ -100,6 +109,11 @@ class SettingsActivity : AppCompatActivity() {
         refreshGamepad()
         refreshCounters()
         refreshUpdateRows()
+        refreshDisplayRow()
+    }
+
+    private fun refreshDisplayRow() {
+        binding.switchAutoRotate.isChecked = DisplaySettings.isAutoRotate(this)
     }
 
     /** 升级开关状态 + 当前版本号（版本号来自 BuildConfig，CI 用 -PappVersion 注入） */
