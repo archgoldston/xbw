@@ -7,6 +7,7 @@ import android.media.AudioTrack
 import android.os.Build
 import android.util.Log
 import android.view.Surface
+import com.xbw.tv.data.display.DisplaySettings
 import java.io.File
 
 /**
@@ -47,6 +48,8 @@ class RetroCore {
     }
 
     private external fun nativeLoadCore(coreLib: String, systemDir: String, romPath: String): Boolean
+    private external fun nativeSetAutoRotate(enabled: Boolean)
+    private external fun nativeVideoLayout(): IntArray
     private external fun nativeSetAudioTrack(track: Any?)
     private external fun nativeSetSurface(surface: Surface?)
     private external fun nativeSetInput(port: Int, bits: Int)
@@ -84,6 +87,7 @@ class RetroCore {
                  systemDir: File, romFile: File): Boolean {
         systemDir.mkdirs()
         val so = File(context.applicationInfo.nativeLibraryDir, "lib$coreName.so").absolutePath
+        nativeSetAutoRotate(DisplaySettings.isAutoRotate(context))
         loaded = nativeLoadCore(so, systemDir.absolutePath, romFile.absolutePath)
         if (!loaded) Log.e(TAG, "loadCore failed core=$coreName rom=${romFile.name}")
         return loaded
@@ -91,6 +95,9 @@ class RetroCore {
 
     /** [baseW, baseH, fps×100, sampleRate]（loadCore 成功后有效） */
     fun avInfo(): IntArray = nativeAvInfo()
+
+    /** [实际旋转次数(逆时针90度), 输出宽, 输出高, 输出宽高比×10000]。 */
+    fun videoLayout(): IntArray = nativeVideoLayout()
 
     /** 建流式 AudioTrack 并交给 native 线程写（WRITE_BLOCKING 做帧限速背压）。
      *  ⚠️ 用老式构造函数而非 Builder：实测某些定制 TV ROM（飞象 p230）把
