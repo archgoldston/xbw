@@ -10,6 +10,7 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.ViewGroup
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -88,6 +89,40 @@ class NativeGameActivity : AppCompatActivity() {
     private lateinit var binding: ActivityNativeGameBinding
     private val core = RetroCore()
     private val handler = Handler(Looper.getMainLooper())
+
+    // 核心可能在开始出帧后才报告方向；低频检查，只在尺寸变化时重排 SurfaceView。
+    private val updateVideoLayout = object : Runnable {
+        override fun run() {
+            if (stopped || !core.running) return
+            fitRotatedVideo()
+            handler.postDelayed(this, 500)
+        }
+    }
+
+    private fun fitRotatedVideo() {
+        val info = core.videoLayout()
+        val parentWidth = binding.root.width
+        val parentHeight = binding.root.height
+        if (parentWidth <= 0 || parentHeight <= 0) return
+        var width = ViewGroup.LayoutParams.MATCH_PARENT
+        var height = ViewGroup.LayoutParams.MATCH_PARENT
+        if (info[0] != 0 && info[1] > 0 && info[2] > 0) {
+            val aspect = if (info[3] > 0) info[3] / 10000.0 else info[1].toDouble() / info[2]
+            if (parentWidth.toDouble() / parentHeight > aspect) {
+                height = parentHeight
+                width = (height * aspect).toInt().coerceIn(1, parentWidth)
+            } else {
+                width = parentWidth
+                height = (width / aspect).toInt().coerceIn(1, parentHeight)
+            }
+        }
+        val params = binding.gameSurface.layoutParams
+        if (params.width != width || params.height != height) {
+            params.width = width
+            params.height = height
+            binding.gameSurface.layoutParams = params
+        }
+    }
 
     private var gameId = ""
     private var gameName = ""
@@ -239,6 +274,7 @@ class NativeGameActivity : AppCompatActivity() {
             binding.loadingOverlay.visibility = View.GONE
             binding.metaBadge.text = "$gameName · ${spec.coreName}"
             binding.metaBadge.visibility = View.VISIBLE
+            handler.post(updateVideoLayout)
         }
     }
 
